@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: wave-music-audio
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: BIND_HOST
+        value: 0.0.0.0
+      - key: BRIDGE_TOKEN
+        generateValue: true
+      - key: CACHE_DIR
+        value: /data
