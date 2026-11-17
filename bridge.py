@@ -539,6 +539,18 @@ class AudioStore:
         self.workers.shutdown(wait=True)
 
 
+def audio_range(value, size):
+    if value is None:
+        return 0, size - 1
+    match = re.fullmatch(r'bytes=(\d+)-(\d+)', value)
+    if not match:
+        raise ValueError('Unsupported audio byte range')
+    start, end = map(int, match.groups())
+    if start >= size or start > end or end - start + 1 > 1048576:
+        raise ValueError('Invalid audio byte range')
+    return start, min(end, size - 1)
+
+
 class Handler(BaseHTTPRequestHandler):
     def reply(self, code, data):
         body = json.dumps(data).encode()
@@ -584,12 +596,23 @@ class Handler(BaseHTTPRequestHandler):
             if route.path == '/audio':
                 stream, size = store.audio(key)
                 with stream:
-                    self.send_response(200)
+                    requested = self.headers.get('Range')
+                    start, end = audio_range(requested, size)
+                    self.send_response(206 if requested else 200)
                     self.send_header('Content-Type', 'audio/mpeg')
-                    self.send_header('Content-Length', str(size))
+                    self.send_header('Accept-Ranges', 'bytes')
+                    self.send_header('Content-Length', str(end - start + 1))
+                    if requested:
+                        self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
                     self.end_headers()
-                    while chunk := stream.read(65536):
+                    stream.seek(start)
+                    remaining = end - start + 1
+                    while remaining:
+                        chunk = stream.read(min(65536, remaining))
+                        if not chunk:
+                            break
                         self.wfile.write(chunk)
+                        remaining -= len(chunk)
                 return
             self.reply(404, {'error': 'Unknown endpoint'})
         except ValueError as exc:
