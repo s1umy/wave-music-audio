@@ -243,25 +243,29 @@ def provider_task_id(data):
 
 
 def provider_download_url(data):
-    if isinstance(data, str) and data.startswith('https://'):
-        return data
+    if isinstance(data, str):
+        value = data.strip()
+        if urlsplit(value).scheme in {'http', 'https'}:
+            return value
     fields = provider_fields(data)
     for candidate in (fields, provider_fields(fields.get('data')), provider_fields(fields.get('result'))):
         value = candidate.get('download_url') or candidate.get('downloadurl') or candidate.get('url')
-        if isinstance(value, str) and value.startswith('https://'):
-            return value
+        if isinstance(value, str) and urlsplit(value.strip()).scheme in {'http', 'https'}:
+            return value.strip()
     provider_shape('download', data)
+    value = fields.get('download_url')
+    print('VideoScale download value type: ' + type(value).__name__ +
+          (' scheme=' + urlsplit(value.strip()).scheme if isinstance(value, str) else ''), flush=True)
     raise RuntimeError('VideoScale finished but returned no supported download URL')
 
 
 def validate_provider_download(url):
     parts = urlsplit(url)
-    if parts.scheme != 'https' or parts.username or parts.password or not parts.hostname:
+    if parts.scheme not in {'http', 'https'} or parts.username or parts.password or not parts.hostname:
         raise ValueError('VideoScale returned an invalid download location')
-    if parts.port not in {None, 443}:
-        raise ValueError('VideoScale returned an unsupported download port')
+    port = parts.port or (443 if parts.scheme == 'https' else 80)
     try:
-        addresses = socket.getaddrinfo(parts.hostname, 443, type=socket.SOCK_STREAM)
+        addresses = socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
     except OSError:
         raise RuntimeError('VideoScale download host could not be resolved') from None
     if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
@@ -281,6 +285,9 @@ def download_provider_file(url, destination):
     total = 0
     deadline = time.monotonic() + 90
     with build_opener(ProviderFileRedirect()).open(request, timeout=30) as response:
+        content_type = response.headers.get('Content-Type', '').split(';')[0].strip().lower()
+        if content_type in {'text/html', 'application/json'}:
+            raise RuntimeError('VideoScale download returned a web page or API response instead of audio')
         length = response.headers.get('Content-Length')
         if length and int(length) >= MAX_BYTES:
             raise ValueError('VideoScale track exceeds the audio size limit')
