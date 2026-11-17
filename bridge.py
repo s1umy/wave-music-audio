@@ -209,27 +209,64 @@ def videoscale_request(path, payload=None, download_location=False):
         raise RuntimeError('VideoScale did not return a JSON API response') from None
 
 
-def select_audio_format(data):
+def provider_formats(data, depth=0):
+    if depth > 4:
+        return []
+    if isinstance(data, str):
+        try:
+            return provider_formats(json.loads(data), depth + 1)
+        except (ValueError, TypeError):
+            return []
+    if isinstance(data, list):
+        return data
     fields = provider_fields(data)
-    formats = data if isinstance(data, list) else fields.get('formats')
-    if not isinstance(formats, list):
-        formats = provider_fields(fields.get('data')).get('formats')
-    candidates = []
-    for raw in formats if isinstance(formats, list) else []:
+    for name in ('formats', 'data', 'result'):
+        if name in fields:
+            formats = provider_formats(fields[name], depth + 1)
+            if formats:
+                return formats
+    return []
+
+
+def format_number(value):
+    try:
+        number = float(value)
+        return number if 0 <= number < 1e15 else 0
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def select_audio_format(data):
+    audio_candidates, combined_candidates = [], []
+    for raw in provider_formats(data):
         item = provider_fields(raw)
         format_id = str(item.get('format_id', ''))
         if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', format_id):
             continue
-        audio_only = (item.get('vcodec') == 'none' and item.get('acodec') not in {None, '', 'none'})
-        audio_only = audio_only or (item.get('has_video') is False and item.get('has_audio') is True)
-        audio_only = audio_only or 'audio only' in str(item.get('format_note', '')).lower()
+        if item.get('has_drm') or item.get('ext') == 'mhtml':
+            continue
+        acodec = str(item.get('acodec') or '').lower()
+        vcodec = str(item.get('vcodec') or '').lower()
+        note = str(item.get('format_note', '')).lower()
+        if acodec == 'none' or item.get('has_audio') is False:
+            continue
+        has_audio = acodec not in {'', 'none'} or item.get('has_audio') is True
+        audio_only = has_audio and (vcodec == 'none' or item.get('has_video') is False or 'audio only' in note)
+        bitrate = format_number(item.get('abr') or item.get('tbr'))
         if audio_only:
-            bitrate = item.get('abr') or item.get('tbr') or 0
-            candidates.append((float(bitrate) if isinstance(bitrate, (int, float)) else 0, format_id))
-    if not candidates:
-        provider_shape('formats', data)
-        raise RuntimeError('VideoScale returned no supported audio-only formats')
-    return max(candidates)[1]
+            audio_candidates.append((bitrate, format_id))
+        elif has_audio and (vcodec not in {'', 'none'} or item.get('has_video') is True):
+            size = format_number(item.get('filesize') or item.get('filesize_approx'))
+            if size >= MAX_BYTES:
+                continue
+            # Prefer the smallest combined stream: only its audio will be retained.
+            combined_candidates.append((format_number(item.get('height')) or 1e9, size or 1e14, -bitrate, format_id))
+    if audio_candidates:
+        return max(audio_candidates)[1]
+    if combined_candidates:
+        return min(combined_candidates)[-1]
+    provider_shape('formats', data)
+    raise RuntimeError('VideoScale returned no supported audio formats for this upload')
 
 
 def provider_task_id(data):
