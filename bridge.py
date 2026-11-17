@@ -6,6 +6,9 @@ from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import hmac
+import base64
+import ipaddress
+import socket
 from collections import OrderedDict
 from contextlib import nullcontext
 import os
@@ -16,7 +19,9 @@ import sys
 from tempfile import TemporaryDirectory
 from threading import Lock, BoundedSemaphore
 import time
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit, urlencode, urljoin
+from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.error import HTTPError, URLError
 
 PORT = int(os.environ.get('PORT', '8765'))
 BIND_HOST = os.environ.get('BIND_HOST', '127.0.0.1')
@@ -155,7 +160,198 @@ def extract_metadata(url):
         return json.loads(run_process(args + ['--extractor-args', 'youtube:player_client=web_embedded,tv', '--', url], 55))
 
 
+VIDEOSCALE_BASE = 'https://gate.apiscrape.net:16262'
+
+
+class NoProviderRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def provider_fields(data):
+    return {str(key).lower(): value for key, value in data.items()} if isinstance(data, dict) else {}
+
+
+def provider_shape(label, data):
+    fields = provider_fields(data)
+    print('VideoScale response shape: ' + label + ' ' + ','.join(sorted(fields)[:20]), flush=True)
+
+
+def videoscale_request(path, payload=None, download_location=False):
+    username = os.environ.get('VIDEOSCALE_API_USERNAME', '')
+    password = os.environ.get('VIDEOSCALE_API_PASSWORD', '')
+    if not username or not password:
+        raise RuntimeError('VideoScale API credentials are not configured on the audio server')
+    token = base64.b64encode((username + ':' + password).encode()).decode()
+    headers = {'Authorization': 'Basic ' + token, 'Accept': 'application/json', 'User-Agent': 'WaveMusic/2'}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        headers['Content-Type'] = 'application/json'
+    try:
+        response = build_opener(NoProviderRedirect()).open(Request(VIDEOSCALE_BASE + path, data=body, headers=headers), timeout=30)
+    except HTTPError as exc:
+        if download_location and exc.code in {301, 302, 303, 307, 308}:
+            return {'download_url': urljoin(VIDEOSCALE_BASE + path, exc.headers.get('Location', ''))}
+        messages = {401: 'VideoScale rejected the API credentials', 403: 'VideoScale denied this API request',
+                    402: 'VideoScale free allowance is exhausted; automatic purchases are disabled',
+                    429: 'VideoScale is rate limiting requests; try again later'}
+        raise RuntimeError(messages.get(exc.code, f'VideoScale API returned HTTP {exc.code}')) from None
+    except (URLError, TimeoutError):
+        raise RuntimeError('VideoScale API could not be reached; try again later') from None
+    with response:
+        raw = response.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        raise RuntimeError('VideoScale returned an oversized API response')
+    try:
+        return json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise RuntimeError('VideoScale did not return a JSON API response') from None
+
+
+def select_audio_format(data):
+    fields = provider_fields(data)
+    formats = data if isinstance(data, list) else fields.get('formats')
+    if not isinstance(formats, list):
+        formats = provider_fields(fields.get('data')).get('formats')
+    candidates = []
+    for raw in formats if isinstance(formats, list) else []:
+        item = provider_fields(raw)
+        format_id = str(item.get('format_id', ''))
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', format_id):
+            continue
+        audio_only = (item.get('vcodec') == 'none' and item.get('acodec') not in {None, '', 'none'})
+        audio_only = audio_only or (item.get('has_video') is False and item.get('has_audio') is True)
+        audio_only = audio_only or 'audio only' in str(item.get('format_note', '')).lower()
+        if audio_only:
+            bitrate = item.get('abr') or item.get('tbr') or 0
+            candidates.append((float(bitrate) if isinstance(bitrate, (int, float)) else 0, format_id))
+    if not candidates:
+        provider_shape('formats', data)
+        raise RuntimeError('VideoScale returned no supported audio-only formats')
+    return max(candidates)[1]
+
+
+def provider_task_id(data):
+    fields = provider_fields(data)
+    for candidate in (fields, provider_fields(fields.get('data'))):
+        value = candidate.get('task_id') or candidate.get('taskid') or candidate.get('id')
+        if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,160}', value):
+            return value
+    provider_shape('create', data)
+    raise RuntimeError('VideoScale task response has an unsupported structure; no automatic resubmission was made')
+
+
+def provider_download_url(data):
+    if isinstance(data, str) and data.startswith('https://'):
+        return data
+    fields = provider_fields(data)
+    for candidate in (fields, provider_fields(fields.get('data')), provider_fields(fields.get('result'))):
+        value = candidate.get('download_url') or candidate.get('downloadurl') or candidate.get('url')
+        if isinstance(value, str) and value.startswith('https://'):
+            return value
+    provider_shape('download', data)
+    raise RuntimeError('VideoScale finished but returned no supported download URL')
+
+
+def validate_provider_download(url):
+    parts = urlsplit(url)
+    if parts.scheme != 'https' or parts.username or parts.password or not parts.hostname:
+        raise ValueError('VideoScale returned an invalid download location')
+    if parts.port not in {None, 443}:
+        raise ValueError('VideoScale returned an unsupported download port')
+    try:
+        addresses = socket.getaddrinfo(parts.hostname, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        raise RuntimeError('VideoScale download host could not be resolved') from None
+    if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+        raise ValueError('VideoScale returned a non-public download location')
+    return url
+
+
+class ProviderFileRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_provider_download(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_provider_file(url, destination):
+    validate_provider_download(url)
+    request = Request(url, headers={'User-Agent': 'WaveMusic/2'})
+    total = 0
+    deadline = time.monotonic() + 90
+    with build_opener(ProviderFileRedirect()).open(request, timeout=30) as response:
+        length = response.headers.get('Content-Length')
+        if length and int(length) >= MAX_BYTES:
+            raise ValueError('VideoScale track exceeds the audio size limit')
+        with destination.open('wb') as output:
+            while chunk := response.read(65536):
+                total += len(chunk)
+                if total >= MAX_BYTES or time.monotonic() > deadline:
+                    raise ValueError('VideoScale download exceeded its size or time limit')
+                output.write(chunk)
+    if total < 100:
+        raise ValueError('VideoScale returned no playable audio')
+
+
+def videoscale_convert(url, target, ffmpeg):
+    task_file = target.with_suffix('.provider.json')
+    task_id = None
+    if task_file.exists() and time.time() - task_file.stat().st_mtime < TTL:
+        try:
+            task_id = provider_task_id(json.loads(task_file.read_text()))
+        except (ValueError, RuntimeError):
+            pass
+    if not task_id:
+        formats = videoscale_request('/api/formats?' + urlencode({'video_url': url}))
+        format_id = select_audio_format(formats)
+        created = videoscale_request('/api/download', {'url': url, 'format_id': format_id,
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '160'}]})
+        task_id = provider_task_id(created)
+        task_file.write_text(json.dumps({'task_id': task_id}))
+        for old in target.parent.glob('*.provider.json'):
+            if time.time() - old.stat().st_mtime >= TTL:
+                old.unlink(missing_ok=True)
+    deadline = time.monotonic() + 180
+    while True:
+        status = videoscale_request('/api/status/' + task_id)
+        fields = provider_fields(status)
+        data = provider_fields(fields.get('data')) or fields
+        state = str(data.get('status') or data.get('state') or '').lower()
+        if state in {'complete', 'completed', 'finished', 'success', 'done'}:
+            break
+        if state in {'failed', 'failure', 'error', 'cancelled', 'canceled'}:
+            raise RuntimeError('VideoScale could not convert this track')
+        if not state:
+            provider_shape('status', status)
+            raise RuntimeError('VideoScale returned an unsupported task-status structure; the existing task was retained')
+        if time.monotonic() >= deadline:
+            raise RuntimeError('VideoScale conversion is still pending; the existing task will be reused on retry')
+        time.sleep(2)
+    location = provider_download_url(videoscale_request('/api/download/' + task_id, download_location=True))
+    source = target.with_suffix('.provider.audio')
+    partial = target.with_suffix('.part.mp3')
+    try:
+        download_provider_file(location, source)
+        with source.open('rb') as audio:
+            prefix = audio.read(3)
+        if prefix.startswith(b'ID3') or (len(prefix) >= 2 and prefix[0] == 255 and prefix[1] & 224 == 224):
+            os.replace(source, target)
+        else:
+            run_process([ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-threads', '1',
+                         '-i', str(source), '-vn', '-t', '7200', '-c:a', 'libmp3lame', '-b:a', '160k',
+                         '-fs', str(MAX_BYTES), str(partial)], 90)
+            if not partial.exists() or not 100 <= partial.stat().st_size < MAX_BYTES:
+                raise ValueError('VideoScale did not produce a playable MP3')
+            os.replace(partial, target)
+    finally:
+        source.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
+
+
 def convert(url, target, ffmpeg):
+    if urlsplit(url).hostname == 'www.youtube.com' and os.environ.get('VIDEOSCALE_API_USERNAME') and os.environ.get('VIDEOSCALE_API_PASSWORD'):
+        return videoscale_convert(url, target, ffmpeg)
     info = extract_metadata(url)
     if info.get('is_live') or info.get('live_status') == 'is_live':
         raise ValueError('Live streams are not supported')
@@ -330,7 +526,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(429, {'error': 'Too many requests; retry in a minute'})
         try:
             if route.path == '/health':
-                return self.reply(200, {'status': 'ok', 'providers': ['soundcloud', 'youtube'], 'version': 2})
+                configured = bool(os.environ.get('VIDEOSCALE_API_USERNAME') and os.environ.get('VIDEOSCALE_API_PASSWORD'))
+                return self.reply(200, {'status': 'ok', 'providers': ['soundcloud', 'youtube'], 'version': 3,
+                                       'youtubeEngine': 'videoscale' if configured else 'yt-dlp'})
             if route.path == '/search':
                 return self.reply(200, youtube_search(query.get('q', [''])[0],
                     int(query.get('limit', ['10'])[0]), int(query.get('offset', ['0'])[0])))
