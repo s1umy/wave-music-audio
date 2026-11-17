@@ -128,17 +128,35 @@ def run_process(args, timeout):
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     if result.returncode:
         message = result.stderr.strip().splitlines()
+        details = [line for line in message if 'WARNING:' in line or 'ERROR:' in line]
+        for line in details[-5:]:
+            print('Audio extractor: ' + re.sub(r'https?://\S+', '[provider URL]', line)[:400], flush=True)
         raise RuntimeError(message[-1][:300] if message else 'Audio preparation failed')
     return result.stdout
 
 
-def convert(url, target, ffmpeg):
-    metadata = run_process([
+def extract_metadata(url):
+    args = [
         sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
         '--skip-download', '--dump-single-json', '--format', 'bestaudio[acodec=mp3]/bestaudio',
-        '--socket-timeout', '15', '--retries', '1', '--', url,
-    ], 55)
-    info = json.loads(metadata)
+        '--socket-timeout', '10', '--retries', '1',
+    ]
+    configured = os.environ.get('YOUTUBE_PLAYER_CLIENTS', '').strip()
+    if configured and urlsplit(url).hostname == 'www.youtube.com':
+        if not all(client in {'web', 'mweb', 'tv', 'web_embedded', 'android_vr'} for client in configured.split(',')):
+            raise ValueError('Unsupported YouTube player client configuration')
+        args += ['--extractor-args', 'youtube:player_client=' + configured]
+    try:
+        return json.loads(run_process(args + ['--', url], 55))
+    except RuntimeError as exc:
+        if configured or urlsplit(url).hostname != 'www.youtube.com' or 'Failed to extract any player response' not in str(exc):
+            raise
+        print('Retrying YouTube metadata with supported alternate clients', flush=True)
+        return json.loads(run_process(args + ['--extractor-args', 'youtube:player_client=web_embedded,tv', '--', url], 55))
+
+
+def convert(url, target, ffmpeg):
+    info = extract_metadata(url)
     if info.get('is_live') or info.get('live_status') == 'is_live':
         raise ValueError('Live streams are not supported')
     if (info.get('duration') or 0) > 7200:
