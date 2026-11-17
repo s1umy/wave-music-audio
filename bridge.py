@@ -1,4 +1,4 @@
-"""SoundCloud audio adapter with optional authenticated remote access."""
+"""Authenticated SoundCloud and YouTube audio adapter."""
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
-from threading import Lock
+from threading import Lock, BoundedSemaphore
 import time
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -36,7 +36,7 @@ class RateLimit:
         self.lock = Lock()
 
     def allow(self, client, route):
-        limit = 30 if route == '/prepare' else 600
+        limit = 30 if route in {'/prepare', '/search'} else 600
         key = (client, route)
         now = time.monotonic()
         with self.lock:
@@ -54,6 +54,19 @@ RATE_LIMIT = RateLimit()
 
 def normalize_url(value):
     parts = urlsplit(value)
+    if parts.scheme != 'https' or parts.username or parts.password or parts.port not in {None, 443}:
+        raise ValueError('Expected an HTTPS SoundCloud track or YouTube video URL')
+    if parts.hostname in {'youtube.com', 'www.youtube.com', 'music.youtube.com', 'm.youtube.com', 'youtu.be'}:
+        if parts.hostname == 'youtu.be':
+            video_id = parts.path.strip('/')
+        elif parts.path == '/watch':
+            video_id = parse_qs(parts.query).get('v', [''])[0]
+        else:
+            match = re.fullmatch(r'/(?:shorts|embed)/([\w-]{11})/?', parts.path)
+            video_id = match[1] if match else ''
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+            raise ValueError('Expected a single YouTube video link')
+        return 'https://www.youtube.com/watch?v=' + video_id
     segments = parts.path.strip('/').split('/')
     if (parts.scheme != 'https' or parts.hostname not in {'soundcloud.com', 'www.soundcloud.com'}
             or parts.username or parts.password or parts.port not in {None, 443}
@@ -61,6 +74,52 @@ def normalize_url(value):
             or segments[0] in {'discover', 'search', 'charts', 'you', 'settings'}):
         raise ValueError('Expected a public https://soundcloud.com/artist/track URL')
     return urlunsplit(('https', 'soundcloud.com', '/' + '/'.join(segments), '', ''))
+
+
+SEARCH_GATE = BoundedSemaphore(1)
+SEARCH_CACHE = OrderedDict()
+SEARCH_LOCK = Lock()
+
+
+def youtube_search(query, limit=10, offset=0):
+    query = str(query).strip()
+    if not query or len(query) > 200 or not 1 <= limit <= 20 or not 0 <= offset <= 80:
+        raise ValueError('Search requires 1-200 characters, limit 1-20, and offset 0-80')
+    key = (query.casefold(), limit, offset)
+    with SEARCH_LOCK:
+        cached = SEARCH_CACHE.get(key)
+        if cached and time.monotonic() - cached[0] < 180:
+            SEARCH_CACHE.move_to_end(key)
+            return cached[1]
+    if not SEARCH_GATE.acquire(blocking=False):
+        raise RuntimeError('Search is busy; retry shortly')
+    try:
+        raw = run_process([
+            sys.executable, '-m', 'yt_dlp', '--ignore-config', '--flat-playlist',
+            '--dump-single-json', '--skip-download', '--socket-timeout', '10',
+            '--retries', '1', '--playlist-start', str(offset + 1),
+            '--playlist-end', str(offset + limit), '--', f'ytsearch{offset + limit}:{query}',
+        ], 40)
+        entries = json.loads(raw).get('entries') or []
+        items = []
+        for entry in entries:
+            video_id = entry.get('id', '')
+            if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id) or entry.get('is_live'):
+                continue
+            items.append({'title': entry.get('title') or 'YouTube track',
+                          'artist': entry.get('uploader') or entry.get('channel') or 'YouTube',
+                          'url': 'https://www.youtube.com/watch?v=' + video_id,
+                          'cover': f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg',
+                          'duration': entry.get('duration')})
+        result = {'items': items, 'nextOffset': offset + limit, 'done': len(entries) < limit or offset + limit >= 100}
+        with SEARCH_LOCK:
+            SEARCH_CACHE[key] = (time.monotonic(), result)
+            SEARCH_CACHE.move_to_end(key)
+            while len(SEARCH_CACHE) > 32:
+                SEARCH_CACHE.popitem(last=False)
+        return result
+    finally:
+        SEARCH_GATE.release()
 
 
 def run_process(args, timeout):
@@ -80,16 +139,21 @@ def convert(url, target, ffmpeg):
         '--socket-timeout', '15', '--retries', '1', '--', url,
     ], 55)
     info = json.loads(metadata)
+    if info.get('is_live') or info.get('live_status') == 'is_live':
+        raise ValueError('Live streams are not supported')
     if (info.get('duration') or 0) > 7200:
         raise ValueError('Track exceeds the two-hour preparation limit')
     audio = info.get('url', '')
     parts = urlsplit(audio)
     host = parts.hostname or ''
+    youtube = urlsplit(url).hostname == 'www.youtube.com'
+    valid_host = (host.endswith('.googlevideo.com') if youtube else
+                  host == 'sndcdn.com' or host.endswith('.sndcdn.com')
+                  or host == 'soundcloud.com' or host.endswith('.soundcloud.com')
+                  or host == 'soundcloud.cloud' or host.endswith('.soundcloud.cloud'))
     if (parts.scheme != 'https' or parts.username or parts.password
-            or not (host == 'sndcdn.com' or host.endswith('.sndcdn.com')
-                    or host == 'soundcloud.com' or host.endswith('.soundcloud.com')
-                    or host == 'soundcloud.cloud' or host.endswith('.soundcloud.cloud'))):
-        raise ValueError('Extractor did not return a SoundCloud audio stream')
+            or not valid_host):
+        raise ValueError('Extractor did not return an allowed provider audio stream')
     partial = target.with_suffix('.part.mp3')
     metadata_file = target.with_suffix('.info.json')
     source_template = str(target.with_suffix('.source.%(ext)s'))
@@ -109,12 +173,12 @@ def convert(url, target, ffmpeg):
             raise ValueError('Audio download did not produce a complete file')
         codec = ['-c:a', 'copy'] if info.get('acodec') == 'mp3' else ['-c:a', 'libmp3lame', '-b:a', '160k']
         run_process([
-            ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+            ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-threads', '1',
             '-i', str(sources[0]), '-vn', '-t', '7200', *codec,
             '-fs', str(MAX_BYTES), str(partial),
-        ], 30)
+        ], 90)
         if not partial.exists() or partial.stat().st_size < 100:
-            raise ValueError('SoundCloud returned no playable audio')
+            raise ValueError('Provider returned no playable audio')
         if partial.stat().st_size >= MAX_BYTES:
             raise ValueError('Track exceeds the audio size limit')
         os.replace(partial, target)
@@ -187,7 +251,7 @@ class AudioStore:
             self.converter(url, job.path, self.ffmpeg)
             status, error = 'ready', None
         except subprocess.TimeoutExpired:
-            status, error = 'error', 'SoundCloud audio preparation timed out'
+            status, error = 'error', 'Audio preparation timed out'
         except Exception as exc:
             status, error = 'error', str(exc)[:300]
         with self.lock:
@@ -248,7 +312,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(429, {'error': 'Too many requests; retry in a minute'})
         try:
             if route.path == '/health':
-                return self.reply(200, {'status': 'ok'})
+                return self.reply(200, {'status': 'ok', 'providers': ['soundcloud', 'youtube'], 'version': 2})
+            if route.path == '/search':
+                return self.reply(200, youtube_search(query.get('q', [''])[0],
+                    int(query.get('limit', ['10'])[0]), int(query.get('offset', ['0'])[0])))
             if route.path == '/prepare':
                 return self.reply(200, store.prepare(query.get('url', [''])[0]))
             key = query.get('id', [''])[0]
