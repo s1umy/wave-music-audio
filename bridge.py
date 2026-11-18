@@ -13,6 +13,7 @@ import math
 from html.parser import HTMLParser
 from bisect import bisect_right
 import socket
+import ssl
 from collections import OrderedDict
 from contextlib import nullcontext
 import os
@@ -45,7 +46,7 @@ class RateLimit:
         self.lock = Lock()
 
     def allow(self, client, route):
-        limit = 30 if route in {'/prepare', '/search', '/playlist-art', '/tenor-search'} else 600
+        limit = 5 if route == '/provider-health' else 30 if route in {'/prepare', '/search', '/playlist-art', '/tenor-search'} else 600
         key = (client, route)
         now = time.monotonic()
         with self.lock:
@@ -220,6 +221,101 @@ def videoscale_request(path, payload=None, download_location=False):
         return json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         raise RuntimeError('VideoScale did not return a JSON API response') from None
+
+
+PROVIDER_PROBE_GATE = BoundedSemaphore(1)
+PROVIDER_PROBE_CACHE = None
+
+
+def network_error(exc):
+    if isinstance(exc, URLError):
+        exc = exc.reason
+    if isinstance(exc, socket.gaierror):
+        category = 'dns_failure'
+    elif isinstance(exc, ssl.SSLCertVerificationError):
+        category = 'tls_certificate_failure'
+    elif isinstance(exc, ssl.SSLError):
+        category = 'tls_handshake_failure'
+    elif isinstance(exc, TimeoutError):
+        category = 'timeout'
+    elif isinstance(exc, ConnectionRefusedError):
+        category = 'connection_refused'
+    elif isinstance(exc, ConnectionResetError):
+        category = 'connection_reset'
+    else:
+        category = 'network_failure'
+    return {'error': category, 'error_type': type(exc).__name__, 'errno': getattr(exc, 'errno', None)}
+
+
+def probe_provider_http(authenticated=False):
+    headers = {'Accept': 'application/json', 'User-Agent': 'WaveMusic/2'}
+    if authenticated:
+        username = os.environ.get('VIDEOSCALE_API_USERNAME', '')
+        password = os.environ.get('VIDEOSCALE_API_PASSWORD', '')
+        if not username or not password:
+            return {'error': 'credentials_not_configured'}
+        headers['Authorization'] = 'Basic ' + base64.b64encode((username + ':' + password).encode()).decode()
+    started = time.monotonic()
+    try:
+        # A nonexistent task only tests connectivity/authentication. It creates no conversion job.
+        with build_opener(NoProviderRedirect()).open(Request(VIDEOSCALE_BASE + '/api/status/wave-network-diagnostic', headers=headers), timeout=8) as response:
+            result = {'http_status': response.status, 'reachable': True}
+    except HTTPError as exc:
+        result = {'http_status': exc.code, 'reachable': True}
+    except (URLError, TimeoutError, ConnectionError, OSError) as exc:
+        result = network_error(exc)
+        result['reachable'] = False
+    result['elapsed_ms'] = round((time.monotonic() - started) * 1000)
+    return result
+
+
+def provider_health():
+    global PROVIDER_PROBE_CACHE
+    if PROVIDER_PROBE_CACHE and time.monotonic() - PROVIDER_PROBE_CACHE[0] < 60:
+        return PROVIDER_PROBE_CACHE[1]
+    if not PROVIDER_PROBE_GATE.acquire(blocking=False):
+        raise RuntimeError('Provider diagnostic is already running; retry shortly')
+    try:
+        target = urlsplit(VIDEOSCALE_BASE)
+        host, port = target.hostname, target.port or 443
+        report = {'checked_at': int(time.time()), 'provider_host': host, 'port': port,
+                  'proxy_configured': any(os.environ.get(name) for name in ('HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy')),
+                  'credentials_configured': bool(os.environ.get('VIDEOSCALE_API_USERNAME') and os.environ.get('VIDEOSCALE_API_PASSWORD'))}
+        started = time.monotonic()
+        try:
+            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            report['dns'] = {'ok': True, 'elapsed_ms': round((time.monotonic() - started) * 1000)}
+        except OSError as exc:
+            addresses = []
+            report['dns'] = {'ok': False, **network_error(exc)}
+        seen, connections = set(), []
+        for family, kind, protocol, _, address in addresses:
+            if family not in {socket.AF_INET, socket.AF_INET6} or family in seen:
+                continue
+            seen.add(family)
+            entry = {'family': 'IPv6' if family == socket.AF_INET6 else 'IPv4'}
+            started = time.monotonic()
+            try:
+                with socket.socket(family, kind, protocol) as connection:
+                    connection.settimeout(4)
+                    connection.connect(address)
+                    entry['tcp'] = {'ok': True, 'elapsed_ms': round((time.monotonic() - started) * 1000)}
+                    started = time.monotonic()
+                    try:
+                        with ssl.create_default_context().wrap_socket(connection, server_hostname=host) as secure:
+                            entry['tls'] = {'ok': True, 'version': secure.version(), 'elapsed_ms': round((time.monotonic() - started) * 1000)}
+                    except OSError as exc:
+                        entry['tls'] = {'ok': False, **network_error(exc)}
+            except OSError as exc:
+                entry['tcp'] = {'ok': False, 'elapsed_ms': round((time.monotonic() - started) * 1000), **network_error(exc)}
+            connections.append(entry)
+        report['connections'] = connections
+        report['http'] = probe_provider_http()
+        report['authenticated_http'] = probe_provider_http(True)
+        PROVIDER_PROBE_CACHE = (time.monotonic(), report)
+        return report
+    finally:
+        PROVIDER_PROBE_GATE.release()
 
 
 def provider_formats(data, depth=0):
@@ -773,6 +869,8 @@ class Handler(BaseHTTPRequestHandler):
                 configured = bool(os.environ.get('VIDEOSCALE_API_USERNAME') and os.environ.get('VIDEOSCALE_API_PASSWORD'))
                 return self.reply(200, {'status': 'ok', 'providers': ['soundcloud', 'youtube'], 'version': 3,
                                        'youtubeEngine': 'videoscale' if configured else 'yt-dlp'})
+            if route.path == '/provider-health':
+                return self.reply(200, provider_health())
             if route.path == '/tenor-search':
                 return self.reply(200, tenor_search(query.get('q', [''])[0]))
             if route.path == '/playlist-art':
