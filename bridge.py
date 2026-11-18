@@ -23,7 +23,7 @@ import sys
 from tempfile import TemporaryDirectory
 from threading import Lock, BoundedSemaphore
 import time
-from urllib.parse import parse_qs, urlsplit, urlunsplit, urlencode, urljoin
+from urllib.parse import parse_qs, urlsplit, urlunsplit, urlencode, urljoin, quote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
@@ -45,7 +45,7 @@ class RateLimit:
         self.lock = Lock()
 
     def allow(self, client, route):
-        limit = 30 if route in {'/prepare', '/search', '/playlist-art'} else 600
+        limit = 30 if route in {'/prepare', '/search', '/playlist-art', '/tenor-search'} else 600
         key = (client, route)
         now = time.monotonic()
         with self.lock:
@@ -548,10 +548,10 @@ ART_LOCK = Lock()
 ART_GATE = BoundedSemaphore(1)
 
 
-def tenor_url(value, media=False):
+def tenor_url(value, media=False, search=False):
     parts = urlsplit(value)
     valid_host = re.fullmatch(r'media[0-9]*\.tenor\.com', parts.hostname or '')
-    page = parts.hostname in {'tenor.com', 'www.tenor.com'} and parts.path.startswith('/view/')
+    page = parts.hostname in {'tenor.com', 'www.tenor.com'} and (parts.path.startswith('/view/') or (search and parts.path.startswith('/search/')))
     if (parts.scheme != 'https' or parts.username or parts.password or parts.port not in {None, 443}
             or not (valid_host or (page and not media))):
         raise ValueError('Paste a Tenor GIF link or a direct media.tenor.com GIF link')
@@ -562,12 +562,12 @@ def tenor_url(value, media=False):
 
 class TenorRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        tenor_url(newurl)
+        tenor_url(newurl, search=True)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def tenor_bytes(url, limit):
-    tenor_url(url)
+def tenor_bytes(url, limit, search=False):
+    tenor_url(url, search=search)
     with build_opener(TenorRedirect()).open(Request(url, headers={'User-Agent': 'WaveMusic/2'}), timeout=25) as response:
         raw = response.read(limit + 1)
     if len(raw) > limit:
@@ -614,6 +614,79 @@ def tenor_atlas(raw):
             raise ValueError('This GIF produces too much cover data; choose a simpler GIF')
         return {'pngHex': output.getvalue().hex(), 'frames': frames, 'columns': columns,
                 'size': size, 'interval': duration / frames}
+
+
+TENOR_SEARCH_CACHE = OrderedDict()
+TENOR_SEARCH_GATE = BoundedSemaphore(1)
+
+
+class TenorSearchResults(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.current = None
+        self.items = []
+        self.seen = set()
+
+    def handle_starttag(self, tag, attrs):
+        fields = dict(attrs)
+        if tag == 'a':
+            href = fields.get('href', '')
+            self.current = 'https://tenor.com' + href if href.startswith('/view/') else None
+        if tag == 'img' and self.current and self.current not in self.seen and len(self.items) < 12:
+            thumbnail = fields.get('src', '')
+            try:
+                tenor_url(thumbnail, media=True)
+            except ValueError:
+                return
+            self.seen.add(self.current)
+            self.items.append({'url': self.current, 'thumbnail': thumbnail, 'title': fields.get('alt', 'Tenor GIF')[:180]})
+
+    def handle_endtag(self, tag):
+        if tag == 'a':
+            self.current = None
+
+
+def tenor_thumbnail(item):
+    from PIL import Image, ImageOps
+    try:
+        raw = tenor_bytes(item['thumbnail'], 1024 * 1024)
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.width * image.height > 4000000:
+                return None
+            tile = ImageOps.fit(image.convert('RGBA'), (96, 96), method=Image.Resampling.LANCZOS)
+            output = io.BytesIO()
+            tile.save(output, format='PNG')
+        return {'url': item['url'], 'title': item['title'], 'pngHex': output.getvalue().hex()}
+    except (ValueError, OSError, URLError):
+        return None
+
+
+def tenor_search(query):
+    query = str(query).strip()
+    if not 1 <= len(query) <= 80:
+        raise ValueError('Enter 1 to 80 characters to search GIFs')
+    key = query.casefold()
+    with ART_LOCK:
+        cached = TENOR_SEARCH_CACHE.get(key)
+        if cached and time.monotonic() - cached[0] < 180:
+            TENOR_SEARCH_CACHE.move_to_end(key)
+            return cached[1]
+    if not TENOR_SEARCH_GATE.acquire(blocking=False):
+        raise RuntimeError('GIF search is busy; try again shortly')
+    try:
+        url = 'https://tenor.com/search/' + quote(query.replace(' ', '-'), safe='') + '-gifs'
+        parser = TenorSearchResults()
+        parser.feed(tenor_bytes(url, 3 * 1024 * 1024, search=True).decode('utf-8', 'replace'))
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            items = [item for item in executor.map(tenor_thumbnail, parser.items) if item]
+        result = {'items': items}
+        with ART_LOCK:
+            TENOR_SEARCH_CACHE[key] = (time.monotonic(), result)
+            while len(TENOR_SEARCH_CACHE) > 8:
+                TENOR_SEARCH_CACHE.popitem(last=False)
+        return result
+    finally:
+        TENOR_SEARCH_GATE.release()
 
 
 def playlist_artwork(url):
@@ -691,6 +764,8 @@ class Handler(BaseHTTPRequestHandler):
                 configured = bool(os.environ.get('VIDEOSCALE_API_USERNAME') and os.environ.get('VIDEOSCALE_API_PASSWORD'))
                 return self.reply(200, {'status': 'ok', 'providers': ['soundcloud', 'youtube'], 'version': 3,
                                        'youtubeEngine': 'videoscale' if configured else 'yt-dlp'})
+            if route.path == '/tenor-search':
+                return self.reply(200, tenor_search(query.get('q', [''])[0]))
             if route.path == '/playlist-art':
                 return self.reply(200, playlist_artwork(query.get('url', [''])[0]))
             if route.path == '/search':
