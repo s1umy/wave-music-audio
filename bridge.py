@@ -192,19 +192,28 @@ def videoscale_request(path, payload=None, download_location=False):
     if payload is not None:
         body = json.dumps(payload).encode()
         headers['Content-Type'] = 'application/json'
-    try:
-        response = build_opener(NoProviderRedirect()).open(Request(VIDEOSCALE_BASE + path, data=body, headers=headers), timeout=30)
-    except HTTPError as exc:
-        if download_location and exc.code in {301, 302, 303, 307, 308}:
-            return {'download_url': urljoin(VIDEOSCALE_BASE + path, exc.headers.get('Location', ''))}
-        messages = {401: 'VideoScale rejected the API credentials', 403: 'VideoScale denied this API request',
-                    402: 'VideoScale free allowance is exhausted; automatic purchases are disabled',
-                    429: 'VideoScale is rate limiting requests; try again later'}
-        raise RuntimeError(messages.get(exc.code, f'VideoScale API returned HTTP {exc.code}')) from None
-    except (URLError, TimeoutError):
-        raise RuntimeError('VideoScale API could not be reached; try again later') from None
-    with response:
-        raw = response.read(2 * 1024 * 1024 + 1)
+    attempts = 3 if payload is None else 1
+    for attempt in range(attempts):
+        try:
+            response = build_opener(NoProviderRedirect()).open(Request(VIDEOSCALE_BASE + path, data=body, headers=headers), timeout=20)
+            with response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+            break
+        except HTTPError as exc:
+            if download_location and exc.code in {301, 302, 303, 307, 308}:
+                return {'download_url': urljoin(VIDEOSCALE_BASE + path, exc.headers.get('Location', ''))}
+            if exc.code in {500, 502, 503, 504} and attempt + 1 < attempts:
+                time.sleep(attempt + 1)
+                continue
+            messages = {401: 'VideoScale rejected the API credentials', 403: 'VideoScale denied this API request',
+                        402: 'VideoScale free allowance is exhausted; automatic purchases are disabled',
+                        429: 'VideoScale is rate limiting requests; try again later'}
+            raise RuntimeError(messages.get(exc.code, f'VideoScale API returned HTTP {exc.code}')) from None
+        except (URLError, TimeoutError, ConnectionError):
+            if attempt + 1 < attempts:
+                time.sleep(attempt + 1)
+                continue
+            raise RuntimeError('VideoScale API could not be reached; try again later') from None
     if len(raw) > 2 * 1024 * 1024:
         raise RuntimeError('VideoScale returned an oversized API response')
     try:
